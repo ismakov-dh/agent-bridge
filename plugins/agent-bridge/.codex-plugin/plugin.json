@@ -1,0 +1,21 @@
+{
+  "name": "agent-bridge",
+  "version": "0.1.0",
+  "description": "Local Codex ↔ Claude Code messaging with automatic inbox delivery.",
+  "author": {
+    "name": "ismakov-dh",
+    "url": "https://github.com/ismakov-dh"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent Bridge",
+    "shortDescription": "Message local Claude Code and Codex sessions.",
+    "longDescription": "Lifecycle hooks register a local peer for each Codex thread. Discover peers, send messages by session name, and receive durable inbox messages automatically through Codex's native queue, including while idle.",
+    "developerName": "ismakov-dh",
+    "category": "Productivity",
+    "capabilities": [],
+    "defaultPrompt": "List the live local sessions I can message."
+  },
+  "repository": "https://github.com/ismakov-dh/agent-bridge",
+  "license": "MIT"
+}

@@ -1,0 +1,10 @@
+{
+  "description": "Register Codex threads as Claude Code peers and deliver their inbox at lifecycle boundaries.",
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/xsm.py\" hook", "timeout": 10}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/xsm.py\" hook", "timeout": 5}]}],
+    "PostToolUse": [{"hooks": [{"type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/xsm.py\" hook", "timeout": 5}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/xsm.py\" hook", "timeout": 5}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/xsm.py\" hook", "timeout": 3}]}]
+  }
+}

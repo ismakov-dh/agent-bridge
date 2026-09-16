@@ -1,0 +1,14 @@
+.research/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+*.sqlite*
+*.sock
+*.key
+*.log
