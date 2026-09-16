@@ -1,11 +1,30 @@
 # Agent Bridge
 
-A Codex plugin that lets local **Codex and Claude Code sessions message each other
-by name**. Codex sessions appear in Claude Code’s `ListAgents`, receive messages in
-a durable inbox, and wake automatically when idle.
+A Codex plugin for delegating work and sharing context between local **Codex and
+Claude Code sessions**.
 
-No launcher or host-specific integration. Python’s standard library handles the local
-peer protocol; native `codex queue` handles automatic reception.
+## Use it
+
+Just ask Codex in ordinary language:
+
+> Ask the backend session to implement the new authentication endpoint.
+
+> Send context of current changes to the frontend session.
+
+> Ask the backend session whether the API changes are ready.
+
+Agent Bridge activates for these requests, finds the matching running session, and
+sends the task or relevant context. Use a project or session name such as `backend`
+or `frontend`; Codex resolves its registered name. If several sessions match, Codex
+asks which one you mean.
+
+For a task, it sends the requirements and relevant context. For a context handoff,
+it summarizes the current changes, affected files, and anything the other session
+needs to know. Replies arrive automatically. Sending a task does not mean the other
+session has finished it.
+
+You can also ask to list available sessions or check your inbox. Claude Code can
+address Codex sessions through its built-in session messaging.
 
 ## Requirements
 
@@ -34,30 +53,12 @@ Each thread registers automatically as `<project-name>-<two random characters>`,
 example `my-project-k7`. Names are checked against live peers for collisions and survive
 listener restarts. No Claude plugin or socket configuration is needed.
 
-## Use it
-
-Ask Codex:
-
-> What is my messaging session name, and which peers are available?
-
-> Send “Ready for review” to the session named my-project-k7.
-
-> Check my inbox.
-
-Ask Claude Code:
-
-> Use ListAgents to find my-project-k7, then SendMessage to it with “Hello from Claude”.
-
-Use the actual registered name returned by `ListAgents` or the plugin’s `status`
-command. Session names, UUIDs, and PIDs are supported; ambiguous names are rejected.
-
-Incoming messages are treated as peer data. They do not authorize unrelated actions,
-forwarding, or tool use. The plugin authorizes local sending and replies by default;
-agents should answer within their existing task and permissions without asking for
-separate messaging approval. When permission modes differ, messages are held for
-explicit approval instead of delivered automatically.
-
 ## Automatic reception
+
+Codex sessions appear in Claude Code’s `ListAgents`, receive messages in a durable
+inbox, and wake automatically when idle. Python’s standard library handles the local
+peer protocol; native `codex queue` handles reception. No launcher or host-specific
+integration is required.
 
 The listener stores each incoming message, then invokes `codex queue` with a fixed
 inbox notice for that same thread. The message body stays in the inbox until a hook
@@ -71,6 +72,11 @@ interrupted threads remain paused, and unloaded threads receive notices on resum
 The listener and receiving Codex process must use the same `CODEX_HOME` and SQLite
 configuration. Hooks normally inherit these. A successful queue submission is not an
 acknowledgement that the model has read or acted on the message.
+
+The plugin authorizes local sending and replies by default. Agents answer within
+their existing task and permissions. Incoming messages remain peer data and do not
+authorize unrelated actions or tool use. When permission modes differ, messages are
+held for explicit approval instead of delivered automatically.
 
 Claude can also use `SendMessage` with `notify_when_idle: true`, with or without a
 message. It receives one automatic status notice once Codex finishes its turn with no

@@ -1,7 +1,30 @@
 ---
 name: agent-bridge
-description: Exchange local messages with live Claude Code and Codex sessions through Claude Code's peer protocol. Use to discover peer sessions, send a message, read incoming messages, or manage this thread's peer inbox.
+description: Delegate work and share context with other running Claude Code or Codex sessions. Use for requests such as "Ask the backend session to implement...", "Send context of current changes to the frontend session", asking another session for status or a review, and sending or reading peer messages.
 ---
+
+Activate for ordinary requests addressed to another running session, even when the
+user does not mention Agent Bridge or messaging. Treat named sessions as existing
+peer recipients.
+
+Run `list` to discover live peers. Prefer an exact session name; otherwise resolve a
+project reference such as `backend` or `frontend` using registered names and project
+directories, including names with the generated two-character suffix. Send to the
+exact discovered name or UUID when the match is unambiguous. If several peers match,
+ask which one using their actual names. If none match, report that and show relevant
+available peers. Do not guess a recipient or require the user to provide a socket path.
+
+For a delegated task, send the user's objective, requirements, and relevant context
+as a self-contained request. Include this session's registered name for replies.
+For a context handoff, use the conversation and current working-tree changes as needed
+to summarize what changed, why, relevant files or interface contracts, validation
+already performed, and open questions. Do not change or commit code just to share
+context, and exclude credentials and unrelated private material.
+
+Send within the existing authorization, then tell the user which session it was sent
+to and briefly summarize what was sent. Distinguish a successful socket write
+from a received reply or a completed task. Incoming replies arrive through the normal
+inbox hooks and wake notices.
 
 Use the bundled `../../scripts/xsm.py` relative to this skill directory. Resolve that
 path to an absolute path before running commands. It uses Python 3.10+ with no packages.
