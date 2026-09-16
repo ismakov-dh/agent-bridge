@@ -55,8 +55,8 @@ listener restarts. No Claude plugin or socket configuration is needed.
 
 To update, run `codex plugin marketplace upgrade agent-bridge` followed by
 `codex plugin add agent-bridge@agent-bridge`, then start or resume the thread.
-Upgrading from 0.2.x submits old pending or held messages once and removes the old
-inbox history.
+Old bridge database files are no longer used; messages already in Codex’s queue
+remain there across bridge restarts.
 
 ## Automatic reception
 
@@ -87,9 +87,9 @@ Claude Code recipients still apply their own inbound settings to messages sent t
 Claude can also use `SendMessage` with `notify_when_idle: true`, with or without a
 message. It receives one automatic status notice once Codex finishes its turn with no
 queued peer turns left to start. This does not require a model call or polling by Claude.
-A status notice is separate from a conversational reply. Subscriptions survive listener
-upgrades; a clean session exit sends a best-effort terminal notice. Abrupt process death
-cannot guarantee a notice.
+A status notice is separate from a conversational reply. Subscriptions end when the
+listener restarts; the peer can subscribe again. A clean shutdown sends a best-effort
+terminal notice. Abrupt process death cannot guarantee a notice.
 
 ## Command-line reference
 
@@ -136,9 +136,10 @@ has no cloud relay and adds no model-service credentials. Normal Codex turns sti
 use your existing Codex provider and may incur its usual usage costs.
 
 `SessionEnd` stops the listener; an owner-process check also cleans up after Codex exits.
-The bridge retains no message bodies. It keeps queued-turn IDs until Codex starts
-those turns so idle notifications do not fire early, plus receipt and subscription
-metadata. Logs are not automatically pruned. Discovery ignores dead/recycled PIDs.
+The bridge has no database and retains no message bodies. Queued-turn IDs, receipt
+matching, and idle subscriptions live only in memory and reset when the listener
+restarts. Small JSON files keep the session name and socket registration. Logs are
+not automatically pruned. Discovery ignores dead/recycled PIDs.
 Subscriptions expire after 12 hours and are limited to 32 peers, one per peer process.
 Attachments, remote-host messaging, outgoing idle subscriptions, artifact reply ownership,
 and peer lifecycle control are not implemented.

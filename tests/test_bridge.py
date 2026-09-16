@@ -84,8 +84,7 @@ class BridgeTests(unittest.TestCase):
         self.raw(frame)
         rows = self.received(self.b)
         self.assertEqual(sum(r["content"] == "fragmented α" for r in rows), 2)
-        with xsm.connect_db(xsm.thread_dir(self.b)) as db:
-            self.assertFalse(db.execute("SELECT 1 FROM sqlite_master WHERE name='messages'").fetchone())
+        self.assertEqual(list(xsm.thread_dir(self.b).glob("*.sqlite*")), [])
 
     def test_bad_auth_rejected(self):
         frame = self.incoming("bad auth")
@@ -137,26 +136,24 @@ class BridgeTests(unittest.TestCase):
         peers = xsm.registered_sessions()
         self.assertEqual({r["sessionId"] for r in peers}, {self.a, self.b})
 
-    def test_upgrade_attempts_old_pending_messages_once_and_discards_history(self):
+    def test_old_listener_upgrade_does_not_suppress_terminal_notices(self):
         thread = str(uuid.uuid4())
-        directory = xsm.thread_dir(thread)
-        xsm.private_dir(directory)
-        with xsm.connect_db(directory) as db:
-            db.execute("CREATE TABLE messages (id TEXT PRIMARY KEY, received INTEGER, sender TEXT, sender_pid INTEGER, content TEXT, state TEXT, kind TEXT)")
-            for state in ('pending', 'held', 'consumed', 'denied'):
-                db.execute('INSERT INTO messages VALUES (?,?,?,?,?,?,?)',
-                           (str(uuid.uuid4()), xsm.now(), self.ra['address'], self.ra['pid'], state, state, 'user'))
+        old = xsm.start(thread, name='old-version-fixture', mode='default', owner=os.getpid())
+        real_rpc = xsm.rpc
+        stopped = []
+        def old_version_rpc(target, action, **params):
+            result = real_rpc(target, action, **params)
+            if target == thread and action == 'status' and result['pid'] == old['pid']:
+                result['bridgeRevision'] = 5
+            if target == thread and action == 'stop':
+                stopped.append(params)
+            return result
         try:
-            xsm.start(thread, name='upgrade-fixture', mode='default', owner=os.getpid())
-            deadline = time.monotonic() + 3
-            while len(messages(self.root, thread)) < 2 and time.monotonic() < deadline:
-                time.sleep(.02)
-            self.assertEqual({row['content'] for row in messages(self.root, thread)}, {'pending', 'held'})
-            xsm.rpc(thread, 'stop')
-            xsm.start(thread, mode='default', owner=os.getpid())
-            self.assertEqual(len(calls(self.root, thread)), 2)
-            with xsm.connect_db(directory) as db:
-                self.assertFalse(db.execute("SELECT 1 FROM sqlite_master WHERE name='messages'").fetchone())
+            with patch.object(xsm, 'rpc', side_effect=old_version_rpc):
+                updated = xsm.start(thread, mode='default', owner=os.getpid())
+            self.assertEqual(stopped, [{'restarting': False}])
+            self.assertEqual(updated['name'], old['name'])
+            self.assertNotEqual(updated['pid'], old['pid'])
         finally:
             xsm.rpc(thread, 'stop')
 

@@ -66,12 +66,10 @@ class IdleTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.bridge.record["statusUpdatedAt"] -= 1000
         marker = str(uuid.uuid4())
-        with xsm.connect_db(self.root) as db:
-            db.execute("INSERT INTO queued_turns VALUES (?)", (marker,))
+        self.bridge.queued_turns.add(marker)
         self.bridge.flush_idle()
         self.assertEqual(self.sent, [])
-        with xsm.connect_db(self.root) as db:
-            db.execute("DELETE FROM queued_turns WHERE id=?", (marker,))
+        self.bridge.queued_turns.remove(marker)
         self.bridge.flush_idle()
         self.assertEqual(len(self.sent), 1)
 
@@ -81,18 +79,14 @@ class IdleTests(unittest.TestCase):
         overflow = self.subscribe(pid=999)
         self.assertEqual(self.sent[-1][1]["state"], "unavailable")
         self.assertEqual(self.sent[-1][1]["orig_msg_id"], overflow)
-        with xsm.connect_db(self.root) as db:
-            db.execute("UPDATE subscriptions SET requested=?", (xsm.now() - xsm.SUBSCRIPTION_TTL - 1,))
+        for row in self.bridge.subscriptions.values():
+            row["requested"] = xsm.now() - xsm.SUBSCRIPTION_TTL - 1
         self.bridge.flush_idle()
         self.assertEqual(len(self.sent), 1)
 
-    def test_retry_and_restart_preserve_subscription(self):
+    def test_idle_notice_gets_one_retry(self):
         request = self.subscribe()
-        self.bridge.restarting = True
-        self.bridge.flush_idle(exiting=True)
-        self.assertEqual(self.sent, [])
-        new = xsm.Bridge(self.thread, self.root, self.config)
-        new.record["statusUpdatedAt"] -= 1000
+        new = self.bridge
         self.wire.side_effect = OSError("fixture transient")
         new.flush_idle()
         self.wire.side_effect = lambda target, frame, **kw: self.sent.append((target, frame))
@@ -100,6 +94,17 @@ class IdleTests(unittest.TestCase):
         self.assertEqual(self.sent[0][1]["orig_msg_id"], request)
         new.flush_idle()
         self.assertEqual(len(self.sent), 1)
+
+    def test_restart_ends_subscription_without_persisting_it(self):
+        request = self.subscribe()
+        self.bridge.restarting = True
+        self.bridge.flush_idle(exiting=True)
+        self.assertEqual(self.sent[0][1]['state'], 'unavailable')
+        self.assertEqual(self.sent[0][1]['orig_msg_id'], request)
+        self.assertEqual(self.bridge.subscriptions, {})
+        new = xsm.Bridge(self.thread, self.root, self.config)
+        self.assertEqual(new.subscriptions, {})
+        self.assertEqual(list(self.root.glob('*.sqlite*')), [])
 
     def test_busy_exit_sends_terminal_notice(self):
         self.subscribe()
@@ -143,8 +148,7 @@ class IdleTests(unittest.TestCase):
         exiting.start()
         try:
             self.assertTrue(entered.wait(2))
-            with xsm.connect_db(self.root) as db:
-                self.assertEqual(db.execute("SELECT count(*) FROM subscriptions").fetchone()[0], 0)
+            self.assertEqual(self.bridge.subscriptions, {})
             self.bridge.flush_idle(exiting=True)
             self.assertEqual(self.wire.call_count, 1)
         finally:
@@ -169,15 +173,13 @@ class IdleTests(unittest.TestCase):
         with patch.object(self.bridge, "queue_message") as submit:
             self.bridge.receive({"type": "user", "message": {"content": "late work"}}, 42)
             submit.assert_not_called()
-        with xsm.connect_db(self.root) as db:
-            self.assertEqual(db.execute("SELECT count(*) FROM queued_turns").fetchone()[0], 0)
+        self.assertEqual(self.bridge.queued_turns, set())
 
     def test_cross_peer_subscription_uuid_collision(self):
         original = self.subscribe()
         self.bridge.subscribe({**self.target, "pid": self.target["pid"] + 1}, original)
         self.assertEqual(self.sent[0][1]["state"], "unavailable")
-        with xsm.connect_db(self.root) as db:
-            self.assertEqual(db.execute("SELECT target_pid FROM subscriptions").fetchone()[0], self.target["pid"])
+        self.assertEqual(set(self.bridge.subscriptions), {self.target["pid"]})
         self.bridge.flush_idle()
         self.assertEqual(len(self.sent), 2)
         self.assertEqual(self.sent[-1][1]["orig_msg_id"], original)

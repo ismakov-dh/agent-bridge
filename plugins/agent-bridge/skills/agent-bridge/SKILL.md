@@ -90,8 +90,9 @@ result. Queue success does not prove the agent has read or acted on the message.
 Claude peers can use `SendMessage` with `notify_when_idle: true` to receive one status
 notice after this thread finishes its turn and has no queued peer turns left to start.
 This also works as a pure subscription without a message and does not start a model turn.
-An idle notice is transport status, not the agent's answer. Listener upgrades preserve
-subscriptions; a clean session exit sends a best-effort terminal notice.
+An idle notice is transport status, not the agent's answer. Subscriptions live in
+memory and end when the listener restarts; subscribe again if needed. A clean shutdown
+sends a best-effort terminal notice. The bridge has no database or persisted message state.
 
 The plugin does not implement attachments, outgoing idle subscriptions, remote-host
 transport, artifact reply ownership, or remote session-control actions. Setup and

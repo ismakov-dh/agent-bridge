@@ -119,6 +119,8 @@ Recognized statuses include `held`, `denied`, `expired`, `delivered`, `refused`,
 `dropped`. The bridge accepts receipts only for known outbound IDs from the verified
 target PID. Native `expired` with `status_detail: refused` is preserved and annotated
 locally with `normalized_status: refused`. Socket-write success is not model delivery.
+Receipt matching keeps at most the latest 1,024 outbound IDs in memory; terminal
+receipts remove their IDs. Restarting the listener clears this metadata.
 
 ## Idle subscriptions
 
@@ -143,12 +145,14 @@ the model. A later authenticated connection carries:
 
 States are `idle`, `exited`, or `unavailable`; `finished_at` is omitted for unavailable.
 The bridge sends no conversation excerpt in `detail`. An idle transition is debounced
-750 ms and requires no outstanding queued peer turns. The bridge stores only a local
-ID per turn, deleted by UserPromptSubmit when Codex begins that queued input. Hooks
+750 ms and requires no outstanding queued peer turns. The bridge keeps only an in-memory
+ID per turn, removed by UserPromptSubmit when Codex begins that queued input. Hooks
 track busy/idle transitions without reading messages or continuing Stop. Capacity is 32 peers with one subscription per verified PID, refreshed
 by a newer request. Expiry is 12 hours, and transient delivery gets one retry.
-Clean exit notifications are best effort. Restarting the listener for an upgrade
-preserves subscriptions and thread/name timestamps without claiming the thread exited.
+Clean exit notifications are best effort. Restarting for an upgrade ends subscriptions
+with an `unavailable` notice. Subscribers must subscribe again. Turn IDs, receipt
+matching, and subscriptions are in memory only and reset on restart; the bridge has
+no database. Thread/name timestamps remain in the registration configuration.
 
 ## Capability audit (Claude Code 2.1.272)
 

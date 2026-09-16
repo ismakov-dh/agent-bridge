@@ -17,7 +17,6 @@ import shutil
 import signal
 import socket
 import socketserver
-import sqlite3
 import stat
 import struct
 import subprocess
@@ -27,13 +26,14 @@ import time
 import uuid
 from urllib.parse import quote, unquote
 
-VERSION = "0.3.0"
-BRIDGE_REVISION = 5
+VERSION = "0.3.1"
+BRIDGE_REVISION = 6
 _CHILDREN = {}
 MAX_FRAME = 1024 * 1024
 MAX_BODY = 128 * 1024
 MAX_QUEUE_TEXT = 120 * 1024  # Below Linux's 128 KiB limit for one argv element.
 MAX_PENDING = 256
+MAX_SENT = 1024
 MAX_SUBSCRIPTIONS = 32
 SUBSCRIPTION_TTL = 12 * 60 * 60 * 1000
 COMMUNICATION = (
@@ -269,23 +269,6 @@ def permission_class(mode):
     return None  # Never claim mode parity when we cannot establish it.
 
 
-@contextlib.contextmanager
-def connect_db(directory):
-    connection = sqlite3.connect(directory / "inbox.sqlite3", timeout=5)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("CREATE TABLE IF NOT EXISTS queued_turns (id TEXT PRIMARY KEY)")
-    connection.execute("CREATE TABLE IF NOT EXISTS sent (id TEXT PRIMARY KEY, target_pid INTEGER NOT NULL)")
-    connection.execute("""CREATE TABLE IF NOT EXISTS subscriptions (
-        id TEXT PRIMARY KEY, target_pid INTEGER UNIQUE NOT NULL, target TEXT NOT NULL,
-        requested INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0)""")
-    try:
-        with connection:
-            yield connection
-    finally:
-        connection.close()
-
-
 def model_context(messages):
     return (
         "Agent Bridge received peer input. " + COMMUNICATION +
@@ -321,6 +304,9 @@ class Bridge:
         self.restarting = False
         self.wake_status = {"lastAttemptAt": None, "lastSuccessAt": None, "lastError": None}
         self.queue_processes = set()
+        self.queued_turns = set()
+        self.sent = {}
+        self.subscriptions = {}
         self.peer_token, self.admin_token = secrets.token_hex(16), secrets.token_hex(32)
         self.registry = claude_dir() / "sessions" / f"{self.pid}.json"
         base = Path(os.environ.get("XSM_SOCKET_DIR", f"/tmp/cc-socks-{os.getuid()}"))
@@ -338,13 +324,6 @@ class Bridge:
             "nameSince": config.get("nameSince", now()), "status": config.get("initialStatus", "idle"),
             "updatedAt": now(), "statusUpdatedAt": config.get("initialStatusUpdatedAt", now()),
         }
-        with connect_db(directory) as db:
-            # Upgrade once: attempt delivery of old pending input, discard old history.
-            legacy = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'").fetchone()
-            self.legacy_messages = ([dict(row) for row in db.execute(
-                "SELECT * FROM messages WHERE state IN ('pending','held') ORDER BY received,rowid")] if legacy else [])
-            if legacy:
-                db.execute("DROP TABLE messages")
 
     @staticmethod
     def linux_domain():
@@ -383,10 +362,11 @@ class Bridge:
                 return  # No remote renames, lifecycle control, or arbitrary commands.
             if frame.get("status") not in ("held", "denied", "expired", "delivered", "refused", "dropped"):
                 return
-            with connect_db(self.directory) as db:
-                sent = db.execute("SELECT target_pid FROM sent WHERE id=?", (frame.get("orig_msg_id"),)).fetchone()
-            if not sent or sent[0] != pid:
-                return
+            with self.lock:
+                if self.sent.get(frame.get("orig_msg_id")) != pid:
+                    return
+                if frame["status"] != "held":
+                    self.sent.pop(frame.get("orig_msg_id"), None)
             if frame.get("status") == "expired" and frame.get("status_detail") == "refused":
                 frame = {**frame, "normalized_status": "refused"}
             content = dumps(frame)
@@ -404,38 +384,42 @@ class Bridge:
     def deliver(self, message, target=None, original_id=None):
         error = None
         try:
-            with self.lock, connect_db(self.directory) as db:
+            with self.lock:
                 if self.stopping.is_set():
                     error = "Listener is stopping"
-                elif db.execute("SELECT count(*) FROM queued_turns").fetchone()[0] >= MAX_PENDING:
+                elif len(self.queued_turns) >= MAX_PENDING:
                     error = "Codex queue is full"
                 else:
                     # Only an ID, used to delay idle notices until this turn starts.
                     # No message bodies, retry buffer, or duplicate history are stored.
-                    db.execute("INSERT INTO queued_turns VALUES (?)", (message["id"],))
+                    self.queued_turns.add(message["id"])
             if error is None and not self.queue_message(message):
                 error = "Codex queue submission failed"
-        except (OSError, ValueError, sqlite3.Error) as exc:
+        except (OSError, ValueError) as exc:
             error = str(exc) or type(exc).__name__
         if error:
-            with contextlib.suppress(OSError, sqlite3.Error):
-                with self.lock, connect_db(self.directory) as db:
-                    db.execute("DELETE FROM queued_turns WHERE id=?", (message["id"],))
+            with self.lock:
+                self.queued_turns.discard(message["id"])
             print(f"xsm: {error}; message was not confirmed queued", file=sys.stderr, flush=True)
             if message["kind"] == "user" and target:
                 self.receipt(target, original_id, "dropped", error)
 
+    def expire_subscriptions(self):
+        cutoff = now() - SUBSCRIPTION_TTL
+        self.subscriptions = {pid: row for pid, row in self.subscriptions.items()
+                              if row["requested"] >= cutoff}
+
     def subscribe(self, target, msg_id):
-        with self.lock, connect_db(self.directory) as db:
-            db.execute("DELETE FROM subscriptions WHERE requested < ?", (now() - SUBSCRIPTION_TTL,))
-            existing = db.execute("SELECT id FROM subscriptions WHERE target_pid=?", (target["pid"],)).fetchone()
-            collision = db.execute("SELECT target_pid FROM subscriptions WHERE id=?", (msg_id,)).fetchone()
-            count = db.execute("SELECT count(*) FROM subscriptions").fetchone()[0]
-            full = (self.stopping.is_set() or (not existing and count >= MAX_SUBSCRIPTIONS)
-                    or (collision and collision[0] != target["pid"]))
+        with self.lock:
+            self.expire_subscriptions()
+            pid = target["pid"]
+            collision = any(row["id"] == msg_id and other != pid
+                            for other, row in self.subscriptions.items())
+            full = (self.stopping.is_set() or collision
+                    or (pid not in self.subscriptions and len(self.subscriptions) >= MAX_SUBSCRIPTIONS))
             if not full:
-                db.execute("INSERT OR REPLACE INTO subscriptions VALUES (?,?,?,?,0)",
-                           (msg_id, target["pid"], dumps(target), now()))
+                self.subscriptions[pid] = {"id": msg_id, "target": target,
+                                           "requested": now(), "attempts": 0}
         if full:
             self.idle_notice(target, msg_id, "unavailable")
 
@@ -455,34 +439,29 @@ class Bridge:
             return False
 
     def flush_idle(self, exiting=False):
-        with self.lock, connect_db(self.directory) as db:
-            if self.restarting:
-                return
-            db.execute("DELETE FROM subscriptions WHERE requested < ?", (now() - SUBSCRIPTION_TTL,))
+        with self.lock:
+            self.expire_subscriptions()
             ready = (self.record["status"] == "idle"
                      and now() - self.record["statusUpdatedAt"] >= 750
-                     and not db.execute("SELECT 1 FROM queued_turns LIMIT 1").fetchone())
+                     and not self.queued_turns)
             if not ready and not exiting:
                 return
-            rows = [dict(r) for r in db.execute("SELECT * FROM subscriptions ORDER BY requested LIMIT ?",
-                                              (MAX_SUBSCRIPTIONS if exiting else 1,))]
+            rows = sorted(self.subscriptions.values(), key=lambda row: row["requested"])
             if not exiting and rows:
                 row = rows[0]
                 # Linearize the bounded send with busy transitions and queue admission.
-                success = self.idle_notice(json.loads(row["target"]), row["id"], "idle")
-                if success or exiting or row["attempts"] >= 1:
-                    db.execute("DELETE FROM subscriptions WHERE id=?", (row["id"],))
+                success = self.idle_notice(row["target"], row["id"], "idle")
+                if success or row["attempts"] >= 1:
+                    self.subscriptions.pop(row["target"]["pid"], None)
                 else:
-                    db.execute("UPDATE subscriptions SET attempts=attempts+1 WHERE id=?", (row["id"],))
+                    row["attempts"] += 1
             elif exiting:
-                # Claim terminal notices before starting bounded best-effort delivery.
-                # A later resume must not replay a notice from a completed session.
-                db.executemany("DELETE FROM subscriptions WHERE id=?", [(row["id"],) for row in rows])
+                self.subscriptions.clear()
         if exiting:
-            def deliver(row):
-                self.idle_notice(json.loads(row["target"]), row["id"], "idle" if ready else "exited")
+            state = "unavailable" if self.restarting else "idle" if ready else "exited"
             # Bounded best-effort exit notices while this authenticated listener still exists.
-            workers = [threading.Thread(target=deliver, args=(row,), daemon=True) for row in rows]
+            workers = [threading.Thread(target=self.idle_notice,
+                       args=(row["target"], row["id"], state), daemon=True) for row in rows]
             for worker in workers:
                 worker.start()
             deadline = time.monotonic() + 2
@@ -493,7 +472,7 @@ class Bridge:
         while not self.stopping.wait(.25):
             try:
                 self.flush_idle()
-            except (OSError, ValueError, sqlite3.Error) as exc:
+            except (OSError, ValueError) as exc:
                 print(f"Idle notification failed: {type(exc).__name__}", file=sys.stderr, flush=True)
 
     def receipt(self, target, original_id, status, detail=None):
@@ -572,13 +551,11 @@ class Bridge:
         if action == "status":
             with self.lock:
                 return {**self.record, "address": address(self.path), "mode": self.config.get("mode"),
-                        "bridgeRevision": BRIDGE_REVISION,
+                        "bridgeRevision": BRIDGE_REVISION, "queuedPeerTurns": len(self.queued_turns),
                         "autoReceive": {"available": self.wake_route()[1], **self.wake_status}}
         if action == "update":
             with self.lock:
-                with connect_db(self.directory) as db:
-                    db.executemany("DELETE FROM queued_turns WHERE id=?",
-                                   [(item,) for item in request.get("started", [])])
+                self.queued_turns.difference_update(request.get("started", []))
                 if "mode" in request:
                     self.config["mode"] = permission_class(request["mode"])
                 if request.get("status") in ("busy", "idle", "waiting") and request["status"] != self.record["status"]:
@@ -614,8 +591,10 @@ class Bridge:
             with self.lock:
                 content = envelope(address(self.path), self.record["name"], self.thread, request["message"], self.config.get("mode"))
             msg_id = str(uuid.uuid4())
-            with connect_db(self.directory) as db:
-                db.execute("INSERT INTO sent VALUES (?,?)", (msg_id, target["pid"]))
+            with self.lock:
+                self.sent[msg_id] = target["pid"]
+                if len(self.sent) > MAX_SENT:
+                    self.sent.pop(next(iter(self.sent)))
             wire_send(target, {"msgV": 1, "msg_id": msg_id, "type": "user", "priority": "next",
                                "session_id": target["sessionId"], "from": address(self.path),
                                "message": {"role": "user", "content": content}})
@@ -681,17 +660,6 @@ class Bridge:
                         "socket": str(self.path), "adminToken": self.admin_token})
             idle_worker = threading.Thread(target=self.idle_loop, daemon=True)
             idle_worker.start()
-            def drain_legacy():
-                for message in self.legacy_messages:
-                    target = None
-                    with contextlib.suppress(OSError, ValueError):
-                        target = resolve_target(message["sender"])
-                    original_id = message["id"]
-                    message["id"] = str(uuid.uuid4())
-                    message.pop("state", None)
-                    self.deliver(message, target, original_id)
-                self.legacy_messages.clear()
-            threading.Thread(target=drain_legacy, daemon=True).start()
             server.timeout = 0.25
             try:
                 last_check = time.monotonic()
@@ -720,7 +688,7 @@ class Bridge:
                 idle_worker.join(timeout=3)
                 try:
                     self.flush_idle(exiting=True)
-                except (OSError, ValueError, sqlite3.Error) as exc:
+                except (OSError, ValueError) as exc:
                     print(f"Exit notification failed: {type(exc).__name__}", file=sys.stderr, flush=True)
                 for process in processes:
                     if process.poll() is None:
@@ -775,9 +743,11 @@ def start(thread, cwd=None, name=None, mode=None, owner=None):
                 pass  # Owner shutdown may race the first status request.
         if current:
             # Upgrade old listeners before reusing their per-thread files. The
-            # Codex owner stays running and the name and idle subscriptions are retained.
+            # Codex owner stays running and the session name is retained.
             with contextlib.suppress(OSError, ValueError, KeyError):
-                rpc(thread, "stop", restarting=True)
+                # Older listeners suppress notices on upgrade because they expect
+                # persistent subscriptions. Let those listeners send a final notice.
+                rpc(thread, "stop", restarting=current.get("bridgeRevision", 0) >= 6)
             deadline = time.monotonic() + 3
             while ((directory / "daemon.json").exists()
                    and start_token(current["pid"]) == current["procStart"]

@@ -25,7 +25,8 @@ Keep this file canonical; `CLAUDE.md` links to it.
   message retries. Report queue failures to the sender with a protocol receipt.
 - Preserve kernel PID/UID checks, recipient authentication, and separate admin tokens.
   Mark queued peer content explicitly untrusted; it cannot expand task authority.
-  Keep only turn-start IDs needed for idle notices and protocol receipt/subscription metadata.
+  Keep turn-start IDs, receipt matching, and idle subscriptions only in memory.
+  No bridge database, persisted message state, or migration machinery. Codex owns its queue.
 - Advertise only implemented protocol features. Never invent permission modes.
 - Default names are `<project-name>-<two random lowercase letters or digits>`;
   check live peers for collisions and preserve names across listener restarts.

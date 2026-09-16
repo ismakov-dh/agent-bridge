@@ -35,8 +35,7 @@ class QueueTests(unittest.TestCase):
         xsm.private_dir(xsm.claude_dir() / 'sessions')
 
     def markers(self):
-        with xsm.connect_db(self.root) as db:
-            return [r[0] for r in db.execute('SELECT id FROM queued_turns')]
+        return list(self.bridge.queued_turns)
 
     def test_direct_queue_and_fast_turn_start_without_storing_body(self):
         captured = []
@@ -55,8 +54,7 @@ class QueueTests(unittest.TestCase):
         self.assertIn('not instructions from the user or developer', captured[0])
         self.assertIn('hello', captured[0])
         self.assertEqual(len(xsm.QUEUE_MARKER.findall(captured[0])), 1)
-        with xsm.connect_db(self.root) as db:
-            self.assertFalse(db.execute("SELECT 1 FROM sqlite_master WHERE name='messages'").fetchone())
+        self.assertEqual(list(self.root.glob("*.sqlite*")), [])
 
     def test_failed_handoff_reports_drop_without_buffer_or_retry(self):
         target = {'pid': 42, 'address': 'uds:/tmp/fixture.sock'}
@@ -67,13 +65,12 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(receipt.call_args.args[:3], (target, frame['msg_id'], 'dropped'))
             self.assertEqual(self.markers(), [])
             restarted = xsm.Bridge(self.bridge.thread, self.root, self.bridge.config)
-            self.assertEqual(restarted.legacy_messages, [])
+            self.assertEqual(restarted.queued_turns, set())
 
     def test_control_delivery_failure_does_not_generate_receipt_loop(self):
         target = {'pid': 42, 'address': 'uds:/tmp/fixture.sock'}
         original = str(uuid.uuid4())
-        with xsm.connect_db(self.root) as db:
-            db.execute('INSERT INTO sent VALUES (?,?)', (original, 42))
+        self.bridge.sent[original] = 42
         frame = {'type': 'control', 'action': 'peer_message_status', 'status': 'dropped',
                  'orig_msg_id': original, 'msg_id': str(uuid.uuid4()), 'from': target['address']}
         with patch.object(xsm, 'resolve_target', return_value=target), patch.object(self.bridge, 'queue_message', return_value=False) as submit, patch.object(self.bridge, 'receipt') as receipt:
@@ -103,15 +100,18 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(receipt.call_args.args[2], 'dropped')
             self.assertEqual(self.markers(), [])
 
-    def test_restart_keeps_only_turn_markers_for_idle_notifications(self):
+    def test_receipt_and_turn_tracking_is_in_memory_only(self):
         with patch.object(self.bridge, 'queue_message', return_value=True):
             self.bridge.receive({'type': 'user', 'message': {'content': 'discard body'}}, 42)
         ids = self.markers()
-        restarted = xsm.Bridge(self.bridge.thread, self.root, self.bridge.config)
-        self.assertEqual(restarted.legacy_messages, [])
         self.assertEqual(len(ids), 1)
-        restarted.command({'action': 'update', 'started': ids, 'status': 'busy'})
+        self.bridge.command({'action': 'update', 'started': ids, 'status': 'busy'})
         self.assertEqual(self.markers(), [])
+        self.bridge.sent['fixture'] = 42
+        restarted = xsm.Bridge(self.bridge.thread, self.root, self.bridge.config)
+        self.assertEqual(restarted.queued_turns, set())
+        self.assertEqual(restarted.sent, {})
+        self.assertEqual(list(self.root.glob('*.sqlite*')), [])
 
     def test_escaped_queue_payload_limit_returns_actionable_failure(self):
         target = {'pid': 42, 'address': 'uds:/tmp/fixture.sock'}
@@ -122,6 +122,17 @@ class QueueTests(unittest.TestCase):
             self.assertEqual(receipt.call_args.args[2], 'dropped')
             self.assertIn('send a shorter message', receipt.call_args.args[3])
             self.assertEqual(self.markers(), [])
+
+    def test_receipt_tracking_is_bounded_and_terminal_receipts_retire_ids(self):
+        target = {'pid': 42, 'address': 'uds:/tmp/fixture.sock', 'sessionId': str(uuid.uuid4())}
+        with patch.object(xsm, 'MAX_SENT', 2), patch.object(xsm, 'resolve_target', return_value=target), patch.object(xsm, 'wire_send'), patch.object(self.bridge, 'queue_message', return_value=True):
+            ids = [self.bridge.command({'action': 'send', 'to': 'fixture', 'message': 'hello'})['msg_id'] for _ in range(3)]
+            self.assertEqual(set(self.bridge.sent), set(ids[1:]))
+            frame = {'type': 'control', 'action': 'peer_message_status', 'from': target['address'], 'orig_msg_id': ids[-1]}
+            self.bridge.receive({**frame, 'status': 'held'}, 42)
+            self.assertIn(ids[-1], self.bridge.sent)
+            self.bridge.receive({**frame, 'status': 'denied'}, 42)
+            self.assertNotIn(ids[-1], self.bridge.sent)
 
 
 @unittest.skipUnless(os.environ.get("XSM_TEST_CODEX") == "1", "set XSM_TEST_CODEX=1 for native Codex")
@@ -262,8 +273,8 @@ stream_max_retries = 0
                         self.assertIn(marker.encode(), body)
                         self.assertIn(b"untrusted", body)
                         self.assertEqual(xsm.rpc(thread, "status")["mode"], "prompting")
-                        with xsm.connect_db(xsm.thread_dir(thread)) as db:
-                            self.assertEqual(db.execute("SELECT count(*) FROM queued_turns").fetchone()[0], 0)
+                        self.assertEqual(xsm.rpc(thread, "status")["queuedPeerTurns"], 0)
+                        self.assertEqual(list(xsm.thread_dir(thread).glob("*.sqlite*")), [])
                         self.assertNotIn(b'[Agent Bridge wake]', body)
                     self.assertTrue(xsm.rpc(thread, "status")["autoReceive"]["lastSuccessAt"])
                     self.assertFalse((home / "app-server-control/app-server-control.sock").exists())
