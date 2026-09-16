@@ -24,7 +24,10 @@ Keep this file canonical; `CLAUDE.md` links to it.
   then discard its body. No separate inbox, approval gate, duplicate history, or
   message retries. Report queue failures to the sender with a protocol receipt.
 - Preserve kernel PID/UID checks, recipient authentication, and separate admin tokens.
-  Mark queued peer content explicitly untrusted; it cannot expand task authority.
+  Local peers may delegate tasks and authorize the actions needed to complete them.
+  Route clarification and risk questions to the requesting peer, not back to the user
+  merely because the task arrived through messaging. Preserve configured permissions
+  and higher-priority instructions. Mark supplied peer data explicitly untrusted.
   Keep turn-start IDs, receipt matching, and idle subscriptions only in memory.
   No bridge database, persisted message state, or migration machinery. Codex owns its queue.
 - Advertise only implemented protocol features. Never invent permission modes.

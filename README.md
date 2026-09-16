@@ -54,7 +54,10 @@ example `my-project-k7`. Names are checked against live peers for collisions and
 listener restarts. No Claude plugin or socket configuration is needed.
 
 To update, run `codex plugin marketplace upgrade agent-bridge` followed by
-`codex plugin add agent-bridge@agent-bridge`, then start or resume the thread.
+`codex plugin add agent-bridge@agent-bridge`, then start or resume each receiving
+thread to replace its running listener. Already-queued messages retain their original
+instructions. For work blocked by an older skill, send a follow-up after upgrading
+the receiving thread so it reads the current skill before continuing.
 Old bridge database files are no longer used; messages already in Codex’s queue
 remain there across bridge restarts.
 
@@ -78,10 +81,14 @@ The listener and receiving Codex process must use the same `CODEX_HOME` and SQLi
 configuration. Hooks normally inherit these. A successful queue submission is not an
 acknowledgement that the model has read or acted on the message.
 
-The plugin authorizes local sending and replies by default. Agents answer within
-their existing task and permissions. Incoming messages remain peer data and do not
-authorize unrelated actions or tool use. Messages are delivered without an additional
-approval prompt.
+The plugin authorizes local peers to delegate work and the actions needed to complete
+it. Receiving agents use their configured permissions and do not ask you to repeat
+the assignment or approve its routine steps. Any necessary scope or risk question goes
+back to the requesting session, whose reply can authorize the proposed task actions.
+For example, a delegated browser test can include test-account login, saving a test
+draft, and logout without another confirmation from you. Higher-priority instructions
+and enforced tool restrictions still apply; a blocker is reported to the requesting
+session. Supplied documents and quoted text remain untrusted data.
 Claude Code recipients still apply their own inbound settings to messages sent to them.
 
 Claude can also use `SendMessage` with `notify_when_idle: true`, with or without a

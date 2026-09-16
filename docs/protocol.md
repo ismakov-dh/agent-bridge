@@ -188,7 +188,10 @@ and stop the listener at session end. They do not consume messages.
 
 The listener invokes native `codex queue` once with sender metadata and the actual
 message in an explicitly untrusted JSON wrapper. The queue prompt identifies itself
-as peer input, not a new instruction from the user. Codex owns durable message storage;
+as peer input. The skill authorizes delegated tasks and necessary tool use within the
+receiver's configured permissions; clarification and risk questions return to the
+requesting peer. This does not promote supplied text to system/developer instructions
+or bypass enforced permissions. Codex owns durable message storage;
 the bridge discards its copy after the attempt and reports a failure to the sender.
 
 Without a daemon, the CLI uses an embedded queue writer and exits. It reads the
