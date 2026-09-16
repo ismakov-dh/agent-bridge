@@ -120,7 +120,9 @@ class BridgeTests(unittest.TestCase):
         xsm.rpc(self.a, "send", to=self.b, message="stop payload")
         output = xsm.hook({"session_id": self.b, "hook_event_name": "Stop", "permission_mode": "default"})
         self.assertEqual(output["decision"], "block")
+        self.assertEqual(xsm.rpc(self.b, "status")["status"], "busy")
         self.assertEqual(xsm.hook({"session_id": self.b, "hook_event_name": "Stop", "stop_hook_active": True}), {})
+        self.assertEqual(xsm.rpc(self.b, "status")["status"], "idle")
 
     def test_restart_registration_is_idempotent(self):
         self.assertEqual(xsm.start(self.a, mode="default")["pid"], self.ra["pid"])
@@ -135,9 +137,20 @@ class BridgeTests(unittest.TestCase):
         xsm.hook({"session_id": self.b, "hook_event_name": "PostToolUse", "permission_mode": "unknown"})
         self.assertIsNone(xsm.rpc(self.b, "status")["mode"])
 
+    def test_stop_inbox_failure_still_publishes_idle(self):
+        real_rpc = xsm.rpc
+        def fail_inbox(thread, action, **params):
+            if action == "inbox":
+                raise OSError("fixture transient inbox failure")
+            return real_rpc(thread, action, **params)
+        with patch.object(xsm, "rpc", side_effect=fail_inbox):
+            self.assertEqual(xsm.hook({"session_id": self.b, "hook_event_name": "Stop"}), {})
+        self.assertEqual(xsm.rpc(self.b, "status")["status"], "idle")
+
     def test_registration_recovers_when_listener_exits_before_attach(self):
         thread = str(uuid.uuid4())
         old = xsm.start(thread, name="race-fixture", mode="default", owner=os.getpid())
+        xsm.rpc(thread, "update", status="busy")
         sent = xsm.rpc(self.a, "send", to=old["name"], message="retained across shutdown race")
         real_rpc = xsm.rpc
         raced = False
@@ -156,6 +169,9 @@ class BridgeTests(unittest.TestCase):
             self.assertTrue(raced)
             self.assertNotEqual(restarted["pid"], old["pid"])
             self.assertEqual(restarted["name"], old["name"])
+            self.assertEqual(restarted["startedAt"], old["startedAt"])
+            self.assertEqual(restarted["nameSince"], old["nameSince"])
+            self.assertEqual(restarted["status"], "busy")
             self.assertIn(sent["msg_id"], {r["id"] for r in xsm.rpc(thread, "inbox")})
         finally:
             xsm.rpc(thread, "stop")

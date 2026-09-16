@@ -46,7 +46,8 @@ XSM_TEST_NATIVE=1 python3 -m unittest discover -s tests -p test_claude_native.py
 
 Native Codex tests require Codex CLI 0.154.0 and use an isolated home plus a local
 mock model. Native Claude tests require Claude Code 2.1.272 and exercise refusal
-without making a model request. Neither test may target existing user sessions.
+without a model request plus idle subscriptions against a loopback mock model.
+Neither test may target existing user sessions.
 Linux bridge tests do not establish native Claude compatibility on Linux.
 
 Before publishing, validate manifests, exercise installation with a temporary

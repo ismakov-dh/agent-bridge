@@ -17,9 +17,9 @@ Relevant fields:
   "cwd": "/example/project",
   "startedAt": 1789556400000,
   "procStart": "Wed Sep 16 11:00:00 2026",
-  "version": "codex-xsm/0.1.0",
+  "version": "codex-xsm/0.2.0",
   "peerProtocol": 1,
-  "peerFeatures": ["reply_across_default_dirs"],
+  "peerFeatures": ["reply_across_default_dirs", "notify_idle"],
   "kind": "interactive",
   "entrypoint": "codex",
   "pidDomain": "darwin",
@@ -116,6 +116,62 @@ Recognized statuses include `held`, `denied`, `expired`, `delivered`, `refused`,
 target PID. Native `expired` with `status_detail: refused` is preserved and annotated
 locally with `normalized_status: refused`. Socket-write success is not model delivery.
 
+## Idle subscriptions
+
+The `notify_idle` capability accepts a control frame with `action: notify_when_idle`,
+`msg_id`, `from`, and optional `from_mode`. The reply address must belong to the
+kernel-verified registered sender. It records a one-shot subscription without waking
+the model. A later authenticated connection carries:
+
+```json
+{
+  "type": "control",
+  "action": "peer_idle_notice",
+  "msgV": 1,
+  "msg_id": "44444444-4444-4444-8444-444444444444",
+  "orig_msg_id": "22222222-2222-4222-8222-222222222222",
+  "state": "idle",
+  "finished_at": 1789556400000,
+  "from": "uds:/tmp/cc-socks-501/12345.sock",
+  "from_mode": "prompting"
+}
+```
+
+States are `idle`, `exited`, or `unavailable`; `finished_at` is omitted for unavailable.
+The bridge sends no conversation excerpt in `detail`. An idle transition is debounced
+750 ms and requires an empty pending/held inbox. A Stop hook that continues processing
+is still busy. Capacity is 32 peers with one subscription per verified PID, refreshed
+by a newer request. Expiry is 12 hours, and transient delivery gets one retry.
+Clean exit notifications are best effort. Restarting the listener for an upgrade
+preserves subscriptions and thread/name timestamps without claiming the thread exited.
+
+## Capability audit (Claude Code 2.1.272)
+
+The native registry advertises three feature names. This is the observed build's
+capability set, not a guarantee about future versions.
+
+| Capability or message | Bridge support | Relevance |
+| --- | --- | --- |
+| `reply_across_default_dirs` | Implemented | Reply across supported local socket directories |
+| `notify_idle` | Incoming subscriptions and outgoing notices | Claude can wait for Codex to become idle |
+| Outgoing `notify_when_idle` / incoming `peer_idle_notice` | Not implemented | Useful next step for Codex waiting on Claude |
+| `artifact_yield` | Not advertised | Coordinates ownership of replies to Claude artifacts, not ordinary chat |
+| `yield_artifact_replies`, `artifact_replies_yielded`, `unyield_artifact_replies` | Ignored | Requires a shared artifact/comment system before it is useful |
+| `peer_message_status` | Implemented | Held, denied, expired, refused, delivered, dropped |
+| `rename` control | Ignored from peers; local rename supported | Remote control of a session name is unnecessary for messaging |
+| Hop-chain loop detection, repeated-body suppression, rate limits | UUID deduplication and inbox/frame limits only | Additional guards are useful for autonomous conversations |
+| `file_attachments` | Text only; attachment metadata is not materialized | Optional local file transfer, separate from message text |
+| Message priority `now`, `next`, `later` | Outgoing `next`; incoming waits for a safe boundary | Interrupting active Codex work is not part of the current workflow |
+
+Native idle notices can include a short final-response `detail`. This is optional;
+the bridge deliberately sends status alone and leaves answers to ordinary messages.
+The native user-message envelope also carries an optional `hop-chain`. The bridge
+parses it syntactically but does not propagate a relay chain. Automatic forwarding is
+not part of the plugin workflow. Native ingress additionally uses a 30-message token
+bucket replenished at 0.5 messages/second per sender, a 30-second consecutive-body
+deduplication window, and hop-chain limits. These are worthwhile follow-up protections
+for autonomous conversations; the current bridge does not claim parity with them.
+
 ## Codex reception
 
 Lifecycle hooks register a listener and consume pending input at SessionStart,
@@ -141,10 +197,11 @@ This behavior was checked against Codex commit
 
 The automated native test uses an unmodified stdio app-server without a shared control
 socket. Two successive peer messages each wake the same thread and enter a loopback
-mock model’s context. The separate native Claude test verifies an authentic refusal
-receipt without starting a model turn. Live manual testing also established a
-name-addressed round trip with Claude Code.
+mock model’s context. Native Claude tests verify an authentic refusal receipt without
+starting a model turn, and drive Claude's own `SendMessage` tool through a loopback
+mock model to subscribe and then receive an idle notice. No paid model is used.
+Live manual testing also established a name-addressed round trip with Claude Code.
 
-Linux native interoperability, attachments, artifact exchange, idle subscriptions,
+Linux native interoperability, attachments, artifact exchange, outgoing idle subscriptions,
 and remote-host messaging remain unverified or unimplemented. Recheck this contract
 before claiming support for a new native version.
