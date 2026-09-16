@@ -10,7 +10,7 @@ Keep this file canonical; `CLAUDE.md` links to it.
 - `plugins/agent-bridge/scripts/xsm.py`: standard-library Python bridge and CLI.
 - `plugins/agent-bridge/hooks/hooks.json`: Codex lifecycle hook definitions.
 - `plugins/agent-bridge/skills/`: instructions delivered to Codex.
-- `tests/`: isolated socket, policy, hook, queue, and native interoperability tests.
+- `tests/`: isolated socket, hook, queue, and native interoperability tests.
 - `docs/protocol.md`: observed wire contract and compatibility limits.
 
 ## Constraints
@@ -20,16 +20,18 @@ Keep this file canonical; `CLAUDE.md` links to it.
 - Wake idle Codex threads with native `codex queue`. Codex 0.154.0 watches its
   shared durable queue every 10 seconds even with a private stdio app-server.
   A missing control socket does not mean automatic reception is unavailable.
-- Keep peer content in the durable inbox. Queue only a fixed notice. Peer text
-  must remain explicitly untrusted and cannot authorize tool use or forwarding.
-- Preserve kernel PID/UID checks, recipient authentication, separate admin tokens,
-  permission-mode parity, duplicate suppression, and held-message approval.
+- Keep delivery simple: receive, call native `codex queue` once with the message,
+  then discard its body. No separate inbox, approval gate, duplicate history, or
+  message retries. Report queue failures to the sender with a protocol receipt.
+- Preserve kernel PID/UID checks, recipient authentication, and separate admin tokens.
+  Mark queued peer content explicitly untrusted; it cannot expand task authority.
+  Keep only turn-start IDs needed for idle notices and protocol receipt/subscription metadata.
 - Advertise only implemented protocol features. Never invent permission modes.
 - Default names are `<project-name>-<two random lowercase letters or digits>`;
   check live peers for collisions and preserve names across listener restarts.
 - Changes to hook definitions invalidate users' exact-definition trust. Prefer
   changing the script when the hook command and lifecycle behavior stay the same.
-- Never publish runtime inboxes, keys, tokens, session histories, extracted vendor
+- Never publish runtime state, keys, tokens, session histories, extracted vendor
   code, machine-specific paths, or research scratch files. Use synthetic fixtures.
 - Use recoverable trash for cleanup. Do not modify or message unrelated live
   sessions during development; native tests create their own isolated sessions.

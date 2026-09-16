@@ -86,15 +86,19 @@ Envelope attributes use the observed order. `from-mode` is `prompting` or `bypas
 it is not an arbitrary permission string. Body text cannot close the outer envelope.
 A missing `session_id` is accepted for native compatibility; a mismatched one is not.
 
-Delivery policy defaults to matching permission classes. Unknown receiver permissions
-hold messages. Mismatched modes hold messages pending explicit approval. A receiver
-in bypass mode also holds messages with unknown sender mode. Remote metadata never
-changes the recipient’s actual permissions.
+Authenticated messages are passed directly to `codex queue`, irrespective of sender
+and recipient permission modes. Remote metadata never changes actual execution
+permissions. Claude recipients independently apply their own inbound policy.
 
-Stored pending, held, and consumed messages are UUID-deduplicated. Refused and
-queue-full messages are not retained, so a repeated UUID can produce another receipt.
-The bridge bounds frames, bodies, and pending/held inbox count. It persists accepted
-messages before requesting a Codex wake.
+The bridge bounds frames, bodies, and outstanding queued turns. Outgoing wire bodies
+are capped at 128 KiB; the fully escaped Codex queue prompt is capped at 120 KiB to
+fit the portable per-argument limit. Oversized queue prompts return a failure receipt
+asking for a shorter message. Each received frame
+gets one queue submission attempt. There is no inbox, approval gate, duplicate history,
+or message retry. Queue failures produce a `peer_message_status` receipt with status
+`dropped` and a diagnostic `status_detail`, when the sender remains reachable.
+A timeout is an uncertain outcome: Codex might already have persisted the turn.
+The bridge does not submit it again automatically.
 
 ## Control receipts
 
@@ -139,8 +143,9 @@ the model. A later authenticated connection carries:
 
 States are `idle`, `exited`, or `unavailable`; `finished_at` is omitted for unavailable.
 The bridge sends no conversation excerpt in `detail`. An idle transition is debounced
-750 ms and requires an empty pending/held inbox. A Stop hook that continues processing
-is still busy. Capacity is 32 peers with one subscription per verified PID, refreshed
+750 ms and requires no outstanding queued peer turns. The bridge stores only a local
+ID per turn, deleted by UserPromptSubmit when Codex begins that queued input. Hooks
+track busy/idle transitions without reading messages or continuing Stop. Capacity is 32 peers with one subscription per verified PID, refreshed
 by a newer request. Expiry is 12 hours, and transient delivery gets one retry.
 Clean exit notifications are best effort. Restarting the listener for an upgrade
 preserves subscriptions and thread/name timestamps without claiming the thread exited.
@@ -159,14 +164,14 @@ capability set, not a guarantee about future versions.
 | `yield_artifact_replies`, `artifact_replies_yielded`, `unyield_artifact_replies` | Ignored | Requires a shared artifact/comment system before it is useful |
 | `peer_message_status` | Implemented | Held, denied, expired, refused, delivered, dropped |
 | `rename` control | Ignored from peers; local rename supported | Remote control of a session name is unnecessary for messaging |
-| Hop-chain loop detection, repeated-body suppression, rate limits | UUID deduplication and inbox/frame limits only | Additional guards are useful for autonomous conversations |
+| Hop-chain loop detection, repeated-body suppression, rate limits | Not implemented; frame/body and outstanding-turn limits only | No duplicate history; automatic forwarding is disabled |
 | `file_attachments` | Text only; attachment metadata is not materialized | Optional local file transfer, separate from message text |
 | Message priority `now`, `next`, `later` | Outgoing `next`; incoming waits for a safe boundary | Interrupting active Codex work is not part of the current workflow |
 
 Native idle notices can include a short final-response `detail`. This is optional;
 the bridge deliberately sends status alone and leaves answers to ordinary messages.
 The native user-message envelope also carries an optional `hop-chain`. The bridge
-parses it syntactically but does not propagate a relay chain. Automatic forwarding is
+does not propagate a relay chain. Automatic forwarding is
 not part of the plugin workflow. Native ingress additionally uses a 30-message token
 bucket replenished at 0.5 messages/second per sender, a 30-second consecutive-body
 deduplication window, and hop-chain limits. These are worthwhile follow-up protections
@@ -174,14 +179,17 @@ for autonomous conversations; the current bridge does not claim parity with them
 
 ## Codex reception
 
-Lifecycle hooks register a listener and consume pending input at SessionStart,
-UserPromptSubmit, PostToolUse, and Stop. Stop can continue the turn once and avoids an
-unconditional polling loop. Hook content is wrapped as untrusted peer data.
+Lifecycle hooks register the listener, track queued-turn starts and busy/idle status,
+and stop the listener at session end. They do not consume messages.
 
-For idle wake-up, the listener invokes native `codex queue` with a fixed inbox notice.
-The peer body stays in the durable inbox. Without a daemon, the CLI uses an embedded
-queue writer and exits. It reads the target’s persisted metadata without resuming it.
-The already-running Codex process notices the shared queue update and dispatches it.
+The listener invokes native `codex queue` once with sender metadata and the actual
+message in an explicitly untrusted JSON wrapper. The queue prompt identifies itself
+as peer input, not a new instruction from the user. Codex owns durable message storage;
+the bridge discards its copy after the attempt and reports a failure to the sender.
+
+Without a daemon, the CLI uses an embedded queue writer and exits. It reads the
+target's persisted metadata without resuming it. The already-running Codex process
+notices the shared queue update and dispatches it.
 
 Codex 0.154.0’s queue extension polls SQLite’s data version every 10 seconds and uses
 a durable per-thread revision index. It considers loaded/resumed threads, waits for
@@ -199,7 +207,7 @@ The automated native test uses an unmodified stdio app-server without a shared c
 socket. Two successive peer messages each wake the same thread and enter a loopback
 mock model’s context. Native Claude tests verify an authentic refusal receipt without
 starting a model turn, and drive Claude's own `SendMessage` tool through a loopback
-mock model to subscribe and then receive an idle notice. No paid model is used.
+mock model to receive a queue-failure receipt and to subscribe for an idle notice. No paid model is used.
 Live manual testing also established a name-addressed round trip with Claude Code.
 
 Linux native interoperability, attachments, artifact exchange, outgoing idle subscriptions,

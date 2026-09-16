@@ -1,5 +1,5 @@
 {
-  "description": "Register Codex threads as Claude Code peers and deliver their inbox at lifecycle boundaries.",
+  "description": "Register Codex threads as Claude Code peers and track session lifecycle.",
   "hooks": {
     "SessionStart": [{"hooks": [{"type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/xsm.py\" hook", "timeout": 10}]}],
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 \"${PLUGIN_ROOT}/scripts/xsm.py\" hook", "timeout": 5}]}],

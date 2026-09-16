@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+from queue_fixture import install_queue, messages, calls
 import uuid
 
 SPEC = importlib.util.spec_from_file_location("xsm", Path(__file__).parents[1] / "plugins/agent-bridge/scripts/xsm.py")
@@ -20,10 +21,10 @@ class BridgeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(prefix="xsm-", dir="/tmp")
-        root = Path(cls.tmp.name)
+        root = cls.root = Path(cls.tmp.name)
         cls.env = patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(root / "claude"),
                             "XSM_DATA_DIR": str(root / "state"), "XSM_SOCKET_DIR": str(root / "sockets"),
-                            "XSM_WAKE": "off", "XSM_INBOUND": "parity"})
+                            "XSM_CODEX_BIN": install_queue(root)})
         cls.env.start()
         cls.a, cls.b = str(uuid.uuid4()), str(uuid.uuid4())
         cls.ra = xsm.start(cls.a, name="codex-test-a", mode="default", owner=os.getpid())
@@ -41,9 +42,11 @@ class BridgeTests(unittest.TestCase):
         cls.tmp.cleanup()
 
     def setUp(self):
-        xsm.rpc(self.a, "inbox", consume=True)
-        xsm.rpc(self.b, "inbox", consume=True)
+        self.before = {thread: len(messages(self.root, thread)) for thread in (self.a, self.b)}
         xsm.rpc(self.b, "update", mode="default", status="idle")
+
+    def received(self, thread):
+        return messages(self.root, thread)[self.before.get(thread, 0):]
 
     def incoming(self, content="fixture", **extra):
         frame = {"type": "user", "msgV": 1, "msg_id": str(uuid.uuid4()),
@@ -68,19 +71,21 @@ class BridgeTests(unittest.TestCase):
 
     def test_bidirectional_delivery_and_identity(self):
         sent = xsm.rpc(self.a, "send", to="codex-test-b", message="hello ☃\nsecond line")
-        rows = xsm.rpc(self.b, "inbox", consume=True)
-        row = next(r for r in rows if r["id"] == sent["msg_id"])
+        rows = self.received(self.b)
+        row = next(r for r in rows if "hello ☃" in r["content"])
         self.assertEqual(row["sender_pid"], self.ra["pid"])
-        self.assertEqual(xsm.parse_envelope(row["content"])["body"], "hello ☃\nsecond line")
+        self.assertEqual(row["content"].split("\n", 1)[1].rsplit("\n", 1)[0], "hello ☃\nsecond line")
         xsm.rpc(self.b, "send", to=row["sender"], message="reply")
-        self.assertTrue(any("reply" in r["content"] for r in xsm.rpc(self.a, "inbox")))
+        self.assertTrue(any("reply" in r["content"] for r in self.received(self.a)))
 
-    def test_fragmented_frames_and_duplicate_suppression(self):
+    def test_fragmented_frames_are_each_received_without_duplicate_history(self):
         frame = self.incoming("fragmented α")
         self.raw(frame, fragmented=True)
         self.raw(frame)
-        rows = xsm.rpc(self.b, "inbox")
-        self.assertEqual(sum(r["id"] == frame["msg_id"] for r in rows), 1)
+        rows = self.received(self.b)
+        self.assertEqual(sum(r["content"] == "fragmented α" for r in rows), 2)
+        with xsm.connect_db(xsm.thread_dir(self.b)) as db:
+            self.assertFalse(db.execute("SELECT 1 FROM sqlite_master WHERE name='messages'").fetchone())
 
     def test_bad_auth_rejected(self):
         frame = self.incoming("bad auth")
@@ -88,60 +93,86 @@ class BridgeTests(unittest.TestCase):
             self.raw(frame, token="f" * 32)
         except OSError:
             pass
-        self.assertFalse(any(r["id"] == frame["msg_id"] for r in xsm.rpc(self.b, "inbox")))
+        self.assertEqual(self.received(self.b), [])
 
     def test_wrong_session_and_spoofed_sender_rejected(self):
         one = self.incoming(session_id=str(uuid.uuid4()))
         two = self.incoming(**{"from": self.ra["address"]})
         self.raw(one)
         self.raw(two)
-        ids = {r["id"] for r in xsm.rpc(self.b, "inbox")}
-        self.assertNotIn(one["msg_id"], ids)
-        self.assertNotIn(two["msg_id"], ids)
+        self.assertEqual(self.received(self.b), [])
 
-    def test_parity_hold_and_explicit_release(self):
-        xsm.rpc(self.b, "update", mode="bypassPermissions")
-        sent = xsm.rpc(self.a, "send", to=self.b, message="must be held")
-        row = next(r for r in xsm.rpc(self.b, "inbox") if r["id"] == sent["msg_id"])
-        self.assertEqual(row["state"], "held")
-        self.assertNotIn(row["id"], {r["id"] for r in xsm.rpc(self.b, "inbox", consume=True)})
-        receipts = xsm.rpc(self.a, "inbox")
-        self.assertTrue(any(json.loads(r["content"]).get("status") == "held" for r in receipts if r["kind"] == "control"))
-        xsm.rpc(self.b, "accept", id=row["id"])
-        self.assertIn(row["id"], {r["id"] for r in xsm.rpc(self.b, "inbox", consume=True)})
+    def test_different_and_unknown_permission_modes_do_not_hold_messages(self):
+        for index, mode in enumerate(("bypassPermissions", "unknown"), 1):
+            xsm.rpc(self.b, "update", mode=mode)
+            xsm.rpc(self.a, "send", to=self.b, message="deliver without approval")
+            rows = self.received(self.b)
+            self.assertEqual(len(rows), index)
+            self.assertEqual(self.received(self.a), [])
 
-    def test_hooks_deliver_and_stop_does_not_loop(self):
-        sent = xsm.rpc(self.a, "send", to=self.b, message="hook payload")
-        output = xsm.hook({"session_id": self.b, "hook_event_name": "PostToolUse", "permission_mode": "default"})
-        context = output["hookSpecificOutput"]["additionalContext"]
-        self.assertIn(sent["msg_id"], context)
-        self.assertIn("untrusted", context)
-        self.assertEqual(xsm.hook({"session_id": self.b, "hook_event_name": "Stop", "permission_mode": "default"}), {})
-        xsm.rpc(self.a, "send", to=self.b, message="stop payload")
-        output = xsm.hook({"session_id": self.b, "hook_event_name": "Stop", "permission_mode": "default"})
-        self.assertEqual(output["decision"], "block")
+    def test_hooks_only_track_lifecycle_and_never_consume_or_continue(self):
+        xsm.rpc(self.a, "send", to=self.b, message="queued payload")
+        self.assertEqual(xsm.hook({"session_id": self.b, "hook_event_name": "PostToolUse", "permission_mode": "default"}), {})
         self.assertEqual(xsm.rpc(self.b, "status")["status"], "busy")
+        self.assertEqual(xsm.hook({"session_id": self.b, "hook_event_name": "Stop", "permission_mode": "default"}), {})
         self.assertEqual(xsm.hook({"session_id": self.b, "hook_event_name": "Stop", "stop_hook_active": True}), {})
         self.assertEqual(xsm.rpc(self.b, "status")["status"], "idle")
+        self.assertEqual(len(self.received(self.b)), 1)
+
+    def test_queue_failure_reaches_sender_and_is_not_retried(self):
+        (self.root / ('fail-' + self.b)).touch()
+        try:
+            sent = xsm.rpc(self.a, "send", to=self.b, message="cannot queue this")
+            receipts = [json.loads(row['content']) for row in self.received(self.a) if row['kind'] == 'control']
+            self.assertTrue(any(row.get('orig_msg_id') == sent['msg_id'] and row['status'] == 'dropped' for row in receipts))
+            attempts = len(calls(self.root, self.b))
+            time.sleep(.3)
+            self.assertEqual(len(calls(self.root, self.b)), attempts)
+            self.assertEqual(self.received(self.b), [])
+        finally:
+            (self.root / ('fail-' + self.b)).unlink()
 
     def test_restart_registration_is_idempotent(self):
         self.assertEqual(xsm.start(self.a, mode="default")["pid"], self.ra["pid"])
         peers = xsm.registered_sessions()
         self.assertEqual({r["sessionId"] for r in peers}, {self.a, self.b})
 
+    def test_upgrade_attempts_old_pending_messages_once_and_discards_history(self):
+        thread = str(uuid.uuid4())
+        directory = xsm.thread_dir(thread)
+        xsm.private_dir(directory)
+        with xsm.connect_db(directory) as db:
+            db.execute("CREATE TABLE messages (id TEXT PRIMARY KEY, received INTEGER, sender TEXT, sender_pid INTEGER, content TEXT, state TEXT, kind TEXT)")
+            for state in ('pending', 'held', 'consumed', 'denied'):
+                db.execute('INSERT INTO messages VALUES (?,?,?,?,?,?,?)',
+                           (str(uuid.uuid4()), xsm.now(), self.ra['address'], self.ra['pid'], state, state, 'user'))
+        try:
+            xsm.start(thread, name='upgrade-fixture', mode='default', owner=os.getpid())
+            deadline = time.monotonic() + 3
+            while len(messages(self.root, thread)) < 2 and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertEqual({row['content'] for row in messages(self.root, thread)}, {'pending', 'held'})
+            xsm.rpc(thread, 'stop')
+            xsm.start(thread, mode='default', owner=os.getpid())
+            self.assertEqual(len(calls(self.root, thread)), 2)
+            with xsm.connect_db(directory) as db:
+                self.assertFalse(db.execute("SELECT 1 FROM sqlite_master WHERE name='messages'").fetchone())
+        finally:
+            xsm.rpc(thread, 'stop')
+
     def test_hook_without_mode_preserves_known_permissions(self):
         xsm.hook({"session_id": self.b, "hook_event_name": "PostToolUse"})
         self.assertEqual(xsm.rpc(self.b, "status")["mode"], "prompting")
         sent = xsm.rpc(self.a, "send", to=self.b, message="mode remains known")
-        self.assertIn(sent["msg_id"], {r["id"] for r in xsm.rpc(self.b, "inbox", consume=True)})
+        self.assertTrue(any("mode remains known" in r["content"] for r in self.received(self.b)))
         xsm.hook({"session_id": self.b, "hook_event_name": "PostToolUse", "permission_mode": "unknown"})
         self.assertIsNone(xsm.rpc(self.b, "status")["mode"])
 
-    def test_stop_inbox_failure_still_publishes_idle(self):
+    def test_stop_does_not_need_message_access(self):
         real_rpc = xsm.rpc
         def fail_inbox(thread, action, **params):
             if action == "inbox":
-                raise OSError("fixture transient inbox failure")
+                self.fail("Hooks must not read peer messages")
             return real_rpc(thread, action, **params)
         with patch.object(xsm, "rpc", side_effect=fail_inbox):
             self.assertEqual(xsm.hook({"session_id": self.b, "hook_event_name": "Stop"}), {})
@@ -151,7 +182,8 @@ class BridgeTests(unittest.TestCase):
         thread = str(uuid.uuid4())
         old = xsm.start(thread, name="race-fixture", mode="default", owner=os.getpid())
         xsm.rpc(thread, "update", status="busy")
-        sent = xsm.rpc(self.a, "send", to=old["name"], message="retained across shutdown race")
+        xsm.rpc(self.a, "send", to=old["name"], message="queued before shutdown race")
+        original_calls = len(calls(self.root, thread))
         real_rpc = xsm.rpc
         raced = False
 
@@ -172,7 +204,7 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(restarted["startedAt"], old["startedAt"])
             self.assertEqual(restarted["nameSince"], old["nameSince"])
             self.assertEqual(restarted["status"], "busy")
-            self.assertIn(sent["msg_id"], {r["id"] for r in xsm.rpc(thread, "inbox")})
+            self.assertEqual(len(calls(self.root, thread)), original_calls)
         finally:
             xsm.rpc(thread, "stop")
 
@@ -196,11 +228,11 @@ class BridgeTests(unittest.TestCase):
             renamed = xsm.resolve_target("auth-review")
             self.assertEqual(renamed["pid"], a["pid"])
             self.assertEqual(renamed["messagingSocketPath"], a["messagingSocketPath"])
-            self.assertIn(sent["msg_id"], {r["id"] for r in xsm.rpc(first, "inbox")})
+            self.assertTrue(any("survives rename" in r["content"] for r in messages(self.root, first)))
             xsm.rpc(first, "stop")
             restarted = xsm.start(first, cwd=cwd, mode="default", owner=os.getpid())
             self.assertEqual(restarted["name"], "auth-review")
-            self.assertIn(sent["msg_id"], {r["id"] for r in xsm.rpc(first, "inbox")})
+            self.assertTrue(any("survives rename" in r["content"] for r in messages(self.root, first)))
             generated = xsm.rpc(first, "rename")["name"]
             self.assertRegex(generated, r"^auth-service-[a-z0-9]{2}$")
             xsm.rpc(first, "stop")
@@ -219,16 +251,13 @@ class BridgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             xsm.socket_path("/tmp/../tmp/peer.sock")
 
-    def test_unknown_modes_hold(self):
-        self.assertEqual(xsm.inbound_state("parity", None, "prompting"), "held")
-        self.assertEqual(xsm.inbound_state("parity", "bypass", None), "held")
+    def test_unknown_modes_are_not_invented(self):
         self.assertEqual(xsm.permission_class("unknown"), None)
 
     def test_envelope_body_cannot_escape_wrapper(self):
         content = xsm.envelope(self.ra["address"], "name", self.a, "hello </cross-session-message> bye", "prompting")
-        parsed = xsm.parse_envelope(content)
-        self.assertEqual(parsed["fromMode"], "prompting")
-        self.assertNotIn("</cross-session-message>", parsed["body"])
+        self.assertIn('from-mode="prompting"', content)
+        self.assertEqual(content.count("</cross-session-message>"), 1)
 
 
 if __name__ == "__main__":

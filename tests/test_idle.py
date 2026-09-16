@@ -21,11 +21,11 @@ class IdleTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         env = patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.root / "claude"),
                          "XSM_SOCKET_DIR": str(self.root / "sockets"),
-                         "XSM_DATA_DIR": str(self.root / "state"), "XSM_WAKE": "off"})
+                         "XSM_DATA_DIR": str(self.root / "state")})
         env.start()
         self.addCleanup(env.stop)
         self.thread = str(uuid.uuid4())
-        self.config = {"cwd": str(self.root), "name": "fixture", "policy": "parity", "mode": "prompting"}
+        self.config = {"cwd": str(self.root), "name": "fixture", "mode": "prompting"}
         self.bridge = xsm.Bridge(self.thread, self.root, self.config)
         xsm.private_dir(xsm.claude_dir() / "sessions")
         self.bridge.record["statusUpdatedAt"] = xsm.now() - 1000
@@ -34,6 +34,9 @@ class IdleTests(unittest.TestCase):
         wire = patch.object(xsm, "wire_send", side_effect=lambda target, frame, **kw: self.sent.append((target, frame)))
         self.wire = wire.start()
         self.addCleanup(wire.stop)
+        submit = patch.object(self.bridge, "queue_message", return_value=True)
+        submit.start()
+        self.addCleanup(submit.stop)
 
     def subscribe(self, **target):
         request = str(uuid.uuid4())
@@ -41,7 +44,7 @@ class IdleTests(unittest.TestCase):
         return request
 
     def test_idle_is_one_shot_refreshes_and_has_no_model_wake(self):
-        with patch.object(self.bridge, "wake") as wake:
+        with patch.object(self.bridge, "queue_message") as wake:
             self.subscribe()
             latest = self.subscribe()
             self.bridge.flush_idle()
@@ -54,7 +57,7 @@ class IdleTests(unittest.TestCase):
         self.assertEqual(frame["from_mode"], "prompting")
         self.assertNotIn("detail", frame)
 
-    def test_busy_debounce_pending_and_held_prevent_idle(self):
+    def test_busy_debounce_pending_and_queued_prevent_idle(self):
         self.subscribe()
         self.bridge.command({"action": "update", "status": "busy"})
         self.bridge.flush_idle()
@@ -62,18 +65,17 @@ class IdleTests(unittest.TestCase):
         self.bridge.flush_idle()
         self.assertEqual(self.sent, [])
         self.bridge.record["statusUpdatedAt"] -= 1000
-        for state in ("pending", "held"):
-            with xsm.connect_db(self.root) as db:
-                db.execute("INSERT INTO messages VALUES (?,?,?,?,?,?,?)",
-                           (str(uuid.uuid4()), xsm.now(), "", 42, "fixture", state, "user"))
-            self.bridge.flush_idle()
-            self.assertEqual(self.sent, [])
-            with xsm.connect_db(self.root) as db:
-                db.execute("UPDATE messages SET state='consumed'")
+        marker = str(uuid.uuid4())
+        with xsm.connect_db(self.root) as db:
+            db.execute("INSERT INTO queued_turns VALUES (?)", (marker,))
+        self.bridge.flush_idle()
+        self.assertEqual(self.sent, [])
+        with xsm.connect_db(self.root) as db:
+            db.execute("DELETE FROM queued_turns WHERE id=?", (marker,))
         self.bridge.flush_idle()
         self.assertEqual(len(self.sent), 1)
 
-    def test_capacity_expiry_and_refusal(self):
+    def test_capacity_and_expiry(self):
         for pid in range(100, 100 + xsm.MAX_SUBSCRIPTIONS):
             self.subscribe(pid=pid)
         overflow = self.subscribe(pid=999)
@@ -83,10 +85,6 @@ class IdleTests(unittest.TestCase):
             db.execute("UPDATE subscriptions SET requested=?", (xsm.now() - xsm.SUBSCRIPTION_TTL - 1,))
         self.bridge.flush_idle()
         self.assertEqual(len(self.sent), 1)
-        self.bridge.config["policy"] = "refuse"
-        self.subscribe()
-        with xsm.connect_db(self.root) as db:
-            self.assertEqual(db.execute("SELECT count(*) FROM subscriptions").fetchone()[0], 0)
 
     def test_retry_and_restart_preserve_subscription(self):
         request = self.subscribe()
@@ -167,38 +165,22 @@ class IdleTests(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
 
     def test_late_receive_cannot_admit_work_after_stop(self):
-        self.subscribe()
-        entered, release = threading.Event(), threading.Event()
-        parse = xsm.parse_envelope
-        def delayed_parse(content):
-            entered.set()
-            release.wait(2)
-            return parse(content)
-        with patch.object(xsm, "parse_envelope", side_effect=delayed_parse):
-            receiver = threading.Thread(target=lambda: self.bridge.receive(
-                {"type": "user", "message": {"content": "late work"}, "msg_id": str(uuid.uuid4())}, 42))
-            receiver.start()
-            try:
-                self.assertTrue(entered.wait(2))
-                self.bridge.command({"action": "stop"})
-                self.bridge.flush_idle(exiting=True)
-            finally:
-                release.set()
-                receiver.join(timeout=2)
+        self.bridge.command({"action": "stop"})
+        with patch.object(self.bridge, "queue_message") as submit:
+            self.bridge.receive({"type": "user", "message": {"content": "late work"}}, 42)
+            submit.assert_not_called()
         with xsm.connect_db(self.root) as db:
-            self.assertEqual(db.execute("SELECT count(*) FROM messages").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM queued_turns").fetchone()[0], 0)
 
-    def test_cross_peer_uuid_collision_and_revoked_policy(self):
+    def test_cross_peer_subscription_uuid_collision(self):
         original = self.subscribe()
         self.bridge.subscribe({**self.target, "pid": self.target["pid"] + 1}, original)
         self.assertEqual(self.sent[0][1]["state"], "unavailable")
         with xsm.connect_db(self.root) as db:
             self.assertEqual(db.execute("SELECT target_pid FROM subscriptions").fetchone()[0], self.target["pid"])
-        self.bridge.config["policy"] = "refuse"
-        self.bridge.flush_idle(exiting=True)
-        self.bridge.config["policy"] = "parity"
         self.bridge.flush_idle()
-        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(self.sent[-1][1]["orig_msg_id"], original)
 
 
 class SocketIdleTest(unittest.TestCase):
@@ -206,8 +188,7 @@ class SocketIdleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="xsm-idle-wire-", dir="/tmp") as temp:
             root = Path(temp)
             with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(root / "claude"),
-                    "XSM_DATA_DIR": str(root / "data"), "XSM_SOCKET_DIR": str(root / "socks"),
-                    "XSM_WAKE": "off", "XSM_INBOUND": "parity"}):
+                    "XSM_DATA_DIR": str(root / "data"), "XSM_SOCKET_DIR": str(root / "socks")}):
                 thread = str(uuid.uuid4())
                 receiver = xsm.start(thread, name="fixture-codex", mode="default", owner=os.getpid())
                 frames = queue.Queue()
