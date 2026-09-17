@@ -26,7 +26,7 @@ import time
 import uuid
 from urllib.parse import quote, unquote
 
-VERSION = "0.3.2"
+VERSION = "0.4.0"
 BRIDGE_REVISION = 7
 _CHILDREN = {}
 MAX_FRAME = 1024 * 1024
