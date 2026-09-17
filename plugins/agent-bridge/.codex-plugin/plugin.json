@@ -7,6 +7,16 @@
     "url": "https://github.com/ismakov-dh"
   },
   "skills": "./skills/",
+  "mcpServers": {
+    "agent_bridge": {
+      "command": "python3",
+      "args": ["scripts/xsm.py", "mcp"],
+      "cwd": ".",
+      "env_vars": ["CLAUDE_CONFIG_DIR", "XSM_DATA_DIR"],
+      "startup_timeout_sec": 10,
+      "tool_timeout_sec": 20
+    }
+  },
   "interface": {
     "displayName": "Agent Bridge",
     "shortDescription": "Delegate tasks and share context across sessions.",
