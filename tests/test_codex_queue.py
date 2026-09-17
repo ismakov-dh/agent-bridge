@@ -152,8 +152,27 @@ class NativeQueueTests(unittest.TestCase):
                 def do_POST(self):
                     body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
                     requests.put((self.path, body))
+                    payload = json.loads(body)
                     item = {"id": "msg_test", "type": "message", "role": "assistant",
                             "content": [{"type": "output_text", "text": "Test response."}]}
+                    if not getattr(model, "called_status", False):
+                        def status_tool(tools, namespace=None):
+                            for tool in tools:
+                                if tool.get("type") == "namespace":
+                                    found = status_tool(tool.get("tools", []), tool["name"])
+                                    if found:
+                                        return found
+                                elif tool.get("name", "").endswith("status"):
+                                    return tool["name"], namespace
+                            return None
+                        selected = status_tool(payload.get("tools", []))
+                        if selected:
+                            model.called_status = True
+                            name, namespace = selected
+                            item = {"id": "fc_status", "type": "function_call", "call_id": "call_status",
+                                    "name": name, "arguments": "{}"}
+                            if namespace:
+                                item["namespace"] = namespace
                     events = [
                         {"type": "response.created", "response": {"id": "resp_test"}},
                         {"type": "response.output_item.added", "output_index": 0, "item": item},
@@ -192,18 +211,16 @@ requires_openai_auth = false
 request_max_retries = 0
 stream_max_retries = 0
 ''')
-            hook_file = json.loads((PLUGIN / "hooks/hooks.json").read_text())
-            for groups in hook_file["hooks"].values():
-                for group in groups:
-                    for hook in group["hooks"]:
-                        hook["command"] = hook["command"].replace("${PLUGIN_ROOT}", str(PLUGIN))
-            (home / "hooks.json").write_text(json.dumps(hook_file))
             env = {**os.environ, "CODEX_HOME": str(home), "XSM_CODEX_BIN": str(binary),
                    "CLAUDE_CONFIG_DIR": str(root / "claude"),
                    "XSM_DATA_DIR": str(root / "data"), "XSM_SOCKET_DIR": str(root / "sockets"),
                    "NO_PROXY": "127.0.0.1,localhost"}
             for key in ("OPENAI_API_KEY", "CODEX_API_KEY", "XSM_CODEX_REMOTE", "CODEX_SQLITE_HOME"):
                 env.pop(key, None)
+            for command in ([binary, "plugin", "marketplace", "add", str(ROOT)],
+                            [binary, "plugin", "add", "agent-bridge@agent-bridge"]):
+                installed = subprocess.run(command, env=env, cwd=project, capture_output=True, text=True, timeout=30)
+                self.assertEqual(installed.returncode, 0, installed.stderr)
             messages = queue.Queue()
             with (root / "server.log").open("w+") as log, patch.dict(os.environ, env, clear=True):
                 proc = subprocess.Popen([binary, "app-server"],
@@ -257,6 +274,10 @@ stream_max_retries = 0
                     call("turn/start", {"threadId": thread, "input": [{"type": "text", "text": "Fixture initial turn."}]})
                     until(lambda msg: msg.get("method") == "turn/completed")
                     self.assertEqual(requests.get(timeout=2)[0], "/v1/responses")
+                    self.assertTrue(getattr(model, "called_status", False), "Installed plugin did not expose its MCP tools")
+                    _, tool_body = requests.get(timeout=2)
+                    self.assertIn(thread.encode(), tool_body)
+                    self.assertIn(b"autoReceive", tool_body)
                     status = xsm.rpc(thread, "status")
                     self.assertTrue(status["autoReceive"]["available"])
                     self.assertFalse((home / "app-server-control/app-server-control.sock").exists())
