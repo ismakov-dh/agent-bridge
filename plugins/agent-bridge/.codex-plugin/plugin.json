@@ -8,7 +8,7 @@
   },
   "skills": "./skills/",
   "mcpServers": {
-    "agent_bridge": {
+    "agent-bridge": {
       "command": "python3",
       "args": ["scripts/xsm.py", "mcp"],
       "cwd": ".",
