@@ -1,12 +1,22 @@
 {
   "name": "agent-bridge",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "Delegate tasks and share context between local Codex and Claude Code sessions.",
   "author": {
     "name": "ismakov-dh",
     "url": "https://github.com/ismakov-dh"
   },
   "skills": "./skills/",
+  "mcpServers": {
+    "agent-bridge": {
+      "command": "python3",
+      "args": ["scripts/xsm.py", "mcp"],
+      "cwd": ".",
+      "env_vars": ["CLAUDE_CONFIG_DIR", "XSM_DATA_DIR"],
+      "startup_timeout_sec": 10,
+      "tool_timeout_sec": 20
+    }
+  },
   "interface": {
     "displayName": "Agent Bridge",
     "shortDescription": "Delegate tasks and share context across sessions.",

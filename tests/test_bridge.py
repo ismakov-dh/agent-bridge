@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -77,6 +78,39 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(row["content"].split("\n", 1)[1].rsplit("\n", 1)[0], "hello ☃\nsecond line")
         xsm.rpc(self.b, "send", to=row["sender"], message="reply")
         self.assertTrue(any("reply" in r["content"] for r in self.received(self.a)))
+
+    def test_mcp_stdio_interactions_use_calling_thread(self):
+        def request(index, method, params):
+            return {"jsonrpc": "2.0", "id": index, "method": method, "params": params}
+        def tool(index, name, arguments, thread):
+            return request(index, "tools/call", {"name": name, "arguments": arguments,
+                                                 "_meta": {"threadId": thread}})
+        frames = [request(1, "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                          "clientInfo": {"name": "test", "version": "1"}}),
+                  {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                  request(2, "tools/list", {}), tool(3, "list_sessions", {}, self.a),
+                  tool(4, "status", {}, self.a),
+                  tool(5, "send_message", {"to": self.rb["name"], "message": "MCP multiline\n'quoted' text"}, self.a),
+                  tool(6, "send_message", {"to": self.ra["name"], "message": "MCP reply"}, self.b),
+                  tool(7, "status", {}, self.b)]
+        result = subprocess.run([sys.executable, str(SPEC.origin), "mcp"],
+                                input="".join(json.dumps(frame) + "\n" for frame in frames),
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        replies = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([reply["id"] for reply in replies], list(range(1, 8)))
+        self.assertEqual({tool["name"] for tool in replies[1]["result"]["tools"]},
+                         {"list_sessions", "status", "send_message", "rename_session"})
+        self.assertEqual({peer["sessionId"] for peer in replies[2]["result"]["structuredContent"]["sessions"]},
+                         {self.a, self.b})
+        self.assertEqual(replies[3]["result"]["structuredContent"]["sessionId"], self.a)
+        self.assertEqual(replies[4]["result"]["structuredContent"]["status"], "sent")
+        self.assertEqual(replies[6]["result"]["structuredContent"]["sessionId"], self.b)
+        self.assertTrue(any("MCP multiline" in row["content"] and row["sender_pid"] == self.ra["pid"]
+                            for row in self.received(self.b)))
+        self.assertTrue(any("MCP reply" in row["content"] and row["sender_pid"] == self.rb["pid"]
+                            for row in self.received(self.a)))
+        self.assertEqual(result.stderr, "")
 
     def test_fragmented_frames_are_each_received_without_duplicate_history(self):
         frame = self.incoming("fragmented α")
