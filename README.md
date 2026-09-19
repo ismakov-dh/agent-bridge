@@ -98,10 +98,26 @@ A status notice is separate from a conversational reply. Subscriptions end when 
 listener restarts; the peer can subscribe again. A clean shutdown sends a best-effort
 terminal notice. Abrupt process death cannot guarantee a notice.
 
-## Command-line reference
+## Agent tools
 
-Agents use the script bundled with the installed skill. For development, run it from
-this checkout:
+Codex uses the plugin's MCP tools for normal interactions. You can keep asking in
+ordinary language; the skill selects the tool and Codex supplies the calling thread
+automatically. No sender thread ID, shell command, or message file is needed.
+
+| Tool | Purpose |
+| --- | --- |
+| `list_sessions` | Discover live peers and their project directories |
+| `status` | Show this thread's name, permissions, and queue availability/result |
+| `send_message` | Send a task, context, or reply using `to` and `message` |
+| `rename_session` | Set `name`, or omit it to restore a project-derived name |
+
+The `message` argument accepts multiline text directly. A successful send confirms a
+socket write. Replies and failure receipts come back through this thread's Codex queue.
+
+## Command-line diagnostics
+
+The Python CLI remains available for manual diagnostics and development. From this
+checkout:
 
 ```sh
 python3 plugins/agent-bridge/scripts/xsm.py list
